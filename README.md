@@ -23,32 +23,14 @@ when hosted:
 GOOGLE_API_KEY = "..."
 WEATHER_API_KEY = "..."
 TAVILY_API_KEY = "..."
-SUPABASE_URL = "https://YOUR_PROJECT.supabase.co"
-SUPABASE_ANON_KEY = "YOUR_SUPABASE_ANON_OR_PUBLISHABLE_KEY"
 ```
 
-Do not use a Supabase `service_role` or secret key in this app. `.env` and
-`.streamlit/secrets.toml` are ignored by Git.
+## Temporary guest mode
 
-## Set up persistent chats and sign-in
-
-1. Create a Supabase project.
-2. In **SQL Editor**, run [`supabase/schema.sql`](supabase/schema.sql). It
-   creates the chat/message tables, a private attachment bucket, and row-level
-   security policies that scope records and files to the signed-in Supabase
-   user.
-3. In **Authentication → Providers**, enable email/password sign-in. Configure
-   email confirmation as desired.
-4. Copy the project URL and the client-side anon/publishable key from
-   **Project Settings → API** into `SUPABASE_URL` and `SUPABASE_ANON_KEY`.
-5. Add all five secret values to Streamlit Secrets and restart the app.
-6. Create an account in the app, confirm the email if required, and sign in.
-
-Chat history and uploaded files are stored in Supabase, not on the Streamlit
-server. Every database query also includes the signed-in user ID; database RLS
-and private Storage policies enforce the same ownership boundary. A browser
-refresh or server restart may require signing in again; chats are restored
-after sign-in. Recordings are transcribed by Gemini and are not saved.
+Sign-in and account creation are currently disabled. Chats, history, and
+attachments stay only in the current Streamlit session and are cleared when the
+session ends or the page is refreshed. Persistent chat storage is not active in
+this mode. `.env` and `.streamlit/secrets.toml` are ignored by Git.
 
 ## Files and voice
 
@@ -69,6 +51,5 @@ Run the local unit tests with:
 python -m unittest discover -s tests -v
 ```
 
-Live Gemini, WeatherAPI, Tavily, Supabase sign-in, cross-account RLS, hosted
-storage, and real browser microphone tests require configured credentials and
-browser permission.
+Live Gemini, WeatherAPI, Tavily, and real browser microphone tests require
+configured credentials and browser permission.

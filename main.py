@@ -6,10 +6,6 @@ import streamlit as st
 from dotenv import load_dotenv
 from google.genai.errors import APIError as GoogleAPIError
 from httpx2 import HTTPError as HttpClientError
-from postgrest.exceptions import APIError as DatabaseAPIError
-from supabase import Client
-from supabase_auth.errors import AuthApiError
-from storage3.exceptions import StorageException
 
 from assistant import (
     FILE_ONLY_QUESTION,
@@ -22,17 +18,14 @@ from attachments import (
     MAX_FILE_BYTES,
     validate_attachments,
 )
-from chat_store import (
-    add_message,
-    chat_title,
-    create_chat,
-    list_chats,
-    load_active_attachments,
-    load_chat_messages,
-    new_client,
-    save_attachment,
-    update_chat,
-    update_chat_context,
+from chat_store import chat_title
+from guest_store import (
+    add_guest_message,
+    create_guest_chat,
+    list_guest_chats,
+    load_guest_active_attachments,
+    save_guest_attachment,
+    set_guest_chat_title,
 )
 
 ROOT = Path(__file__).resolve().parent
@@ -51,60 +44,6 @@ def get_secret(name: str) -> str | None:
 
 def reset_composer() -> None:
     st.session_state["composer_nonce"] = st.session_state.get("composer_nonce", 0) + 1
-
-
-def show_authentication() -> tuple[Client, str] | None:
-    url = get_secret("SUPABASE_URL")
-    anon_key = get_secret("SUPABASE_ANON_KEY")
-    if not url or not anon_key:
-        st.error(
-            "Set SUPABASE_URL and SUPABASE_ANON_KEY in Streamlit Secrets "
-            "before signing in."
-        )
-        return None
-
-    client = st.session_state.get("supabase_client")
-    user_id = st.session_state.get("user_id")
-    if client and user_id:
-        return client, user_id
-
-    st.subheader("Sign in to save your chats")
-    mode = st.radio("Account", ["Sign in", "Create account"], horizontal=True)
-    with st.form("account_form"):
-        email = st.text_input("Email", autocomplete="email")
-        password = st.text_input(
-            "Password", type="password", autocomplete="current-password"
-        )
-        submitted = st.form_submit_button(mode)
-
-    if submitted:
-        if not email.strip() or len(password) < 8:
-            st.error("Enter your email and a password of at least 8 characters.")
-            return None
-        client = new_client(url, anon_key)
-        try:
-            if mode == "Create account":
-                response = client.auth.sign_up(
-                    {"email": email.strip(), "password": password}
-                )
-            else:
-                response = client.auth.sign_in_with_password(
-                    {"email": email.strip(), "password": password}
-                )
-        except AuthApiError as error:
-            st.error(f"Sign-in failed: {error}")
-            return None
-
-        if response.user is None or response.session is None:
-            st.info("Check your email to confirm the account, then sign in.")
-            return None
-        st.session_state["supabase_client"] = client
-        st.session_state["user_id"] = str(response.user.id)
-        st.session_state["active_chat_id"] = None
-        st.session_state["new_chat_requested"] = False
-        st.rerun()
-
-    return None
 
 
 def render_message(message: dict) -> None:
@@ -135,8 +74,8 @@ def render_message(message: dict) -> None:
                 )
 
 
-def show_chat_sidebar(client: Client, user_id: str) -> tuple[dict | None, list[dict]]:
-    chats = list_chats(client, user_id)
+def show_chat_sidebar() -> tuple[dict | None, list[dict]]:
+    chats = list_guest_chats(st.session_state.setdefault("guest_chats", {}))
     chat_ids = {chat["id"] for chat in chats}
 
     with st.sidebar:
@@ -167,19 +106,10 @@ def show_chat_sidebar(client: Client, user_id: str) -> tuple[dict | None, list[d
                 st.rerun()
 
         st.divider()
-        st.caption("Signed in")
-        if st.button("Sign out", use_container_width=True):
-            client.auth.sign_out()
-            for key in ("supabase_client", "user_id", "active_chat_id"):
-                st.session_state.pop(key, None)
-            st.session_state["new_chat_requested"] = False
-            reset_composer()
-            st.rerun()
+        st.caption("Guest mode · chats last for this session")
 
     active_chat = next((chat for chat in chats if chat["id"] == selected_id), None)
-    messages = (
-        load_chat_messages(client, user_id, selected_id) if active_chat else []
-    )
+    messages = active_chat["messages"] if active_chat else []
     return active_chat, messages
 
 
@@ -239,8 +169,6 @@ def render_composer(google_api_key: str | None) -> tuple[str, list[tuple[str, by
 
 
 def save_and_answer(
-    client: Client,
-    user_id: str,
     chat: dict | None,
     messages: list[dict],
     question: str,
@@ -256,24 +184,21 @@ def save_and_answer(
     file_names = [attachment.file_name for attachment in prepared]
     first_user_message = not any(row["role"] == "user" for row in messages)
     title = chat_title(question, file_names)
+    chats = st.session_state.setdefault("guest_chats", {})
     if chat is None:
-        chat = create_chat(client, user_id, title)
+        chat = create_guest_chat(chats, title)
         st.session_state["active_chat_id"] = chat["id"]
         st.session_state["new_chat_requested"] = False
     elif first_user_message:
-        update_chat(client, user_id, chat["id"], title, [])
+        set_guest_chat_title(chat, title)
 
-    user_message = add_message(
-        client,
-        user_id,
-        chat["id"],
+    user_message = add_guest_message(
+        chat,
         "user",
         question.strip(),
     )
     stored_attachments = [
-        save_attachment(
-            client, user_id, chat["id"], user_message["id"], attachment
-        )
+        save_guest_attachment(chat, user_message["id"], attachment)
         for attachment in prepared
     ]
 
@@ -283,13 +208,11 @@ def save_and_answer(
         else chat.get("active_attachment_ids", [])
     )
     if stored_attachments:
-        update_chat_context(client, user_id, chat["id"], active_ids)
+        chat["active_attachment_ids"] = active_ids
 
     if not question.strip() and stored_attachments:
-        add_message(
-            client,
-            user_id,
-            chat["id"],
+        add_guest_message(
+            chat,
             "assistant",
             FILE_ONLY_QUESTION,
         )
@@ -297,9 +220,7 @@ def save_and_answer(
     if not question.strip():
         raise ValueError("Type a question, attach a file, or record a voice question.")
 
-    active_attachments = load_active_attachments(
-        client, user_id, chat["id"], active_ids
-    )
+    active_attachments = load_guest_active_attachments(chat, active_ids)
     previous_history = [
         {"role": row["role"], "content": row["content"]}
         for row in messages
@@ -313,10 +234,8 @@ def save_and_answer(
         get_secret("WEATHER_API_KEY") or "",
         get_secret("TAVILY_API_KEY") or "",
     )
-    add_message(
-        client,
-        user_id,
-        chat["id"],
+    add_guest_message(
+        chat,
         "assistant",
         reply["content"],
         reply["metadata"],
@@ -326,12 +245,7 @@ def save_and_answer(
 st.set_page_config(page_title="My AI Assistant", layout="wide")
 st.title("My AI Assistant")
 
-auth_result = show_authentication()
-if auth_result is None:
-    st.stop()
-
-client, user_id = auth_result
-active_chat, messages = show_chat_sidebar(client, user_id)
+active_chat, messages = show_chat_sidebar()
 for message in messages:
     render_message(message)
 
@@ -339,8 +253,6 @@ question, uploaded_files, send = render_composer(get_secret("GOOGLE_API_KEY"))
 if send:
     try:
         save_and_answer(
-            client,
-            user_id,
             active_chat,
             messages,
             question,
@@ -348,11 +260,8 @@ if send:
         )
     except (
         ValueError,
-        AuthApiError,
-        DatabaseAPIError,
         GoogleAPIError,
         HttpClientError,
-        StorageException,
     ) as error:
         st.session_state["flash_error"] = str(error)
     else:
