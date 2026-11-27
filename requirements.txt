@@ -1,0 +1,10 @@
+streamlit>=1.45,<2
+deepagents>=0.4,<1
+langchain>=1,<2
+langchain-google-genai>=4.5,<5
+requests>=2.32,<3
+python-dotenv>=1,<2
+tavily-python>=0.7,<1
+fpdf2>=2.8.4,<3
+uharfbuzz>=0.45
+graphviz>=0.20,<1
