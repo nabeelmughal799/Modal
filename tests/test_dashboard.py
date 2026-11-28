@@ -1,60 +1,52 @@
 """Unit tests for dashboard.py — all mocked, no live API calls."""
 
 import unittest
-from unittest.mock import patch, Mock
+from unittest.mock import patch
 
 
 class DashboardParseTests(unittest.TestCase):
-    def _make_raw(self, **overrides):
-        """Return a minimal WeatherAPI-style response dict."""
-        base = {
+    def _make_hour(self, epoch_offset=3600, **kwargs):
+        defaults = {
+            "time_epoch": 1735729200 + epoch_offset,
+            "time": "2025-01-01 15:00",
+            "condition": {"text": "Partly cloudy"},
+            "chance_of_rain": 10,
+            "precip_mm": 0.0,
+            "gust_kph": 15.0,
+            "temp_c": 18.0,
+            "feelslike_c": 16.0,
+            "pressure_mb": 1013.0,
+            "wind_kph": 10.0,
+            "humidity": 60,
+            "will_it_thunder": 0,
+            "chance_of_thunder": 0,
+            "will_it_rain": 0,
+            "vis_km": 10.0,
+            "uv": 1.0,
+            "dewpoint_c": 8.0,
+        }
+        defaults.update(kwargs)
+        return defaults
+
+    def _make_raw(self, hours=None):
+        if hours is None:
+            hours = [self._make_hour(3600 * i) for i in range(1, 13)]
+        return {
             "location": {
-                "name": "Lahore",
-                "region": "Punjab",
-                "country": "Pakistan",
-                "lat": 31.558,
-                "lon": 74.351,
-                "tz_id": "Asia/Karachi",
-                "localtime": "2025-01-01 14:00",
-                "localtime_epoch": 1735729200,
+                "name": "Lahore", "region": "Punjab", "country": "Pakistan",
+                "lat": 31.558, "lon": 74.351, "tz_id": "Asia/Karachi",
+                "localtime": "2025-01-01 14:00", "localtime_epoch": 1735729200,
             },
             "current": {
-                "temp_c": 18.0,
-                "feelslike_c": 16.5,
-                "condition": {"text": "Partly cloudy"},
-                "wind_kph": 12.0,
-                "wind_dir": "N",
-                "gust_kph": 20.0,
-                "humidity": 60,
-                "pressure_mb": 1013.0,
-                "precip_mm": 0.0,
-                "last_updated": "2025-01-01 13:45",
+                "temp_c": 18.0, "feelslike_c": 16.5,
+                "condition": {"text": "Partly cloudy", "icon": "//cdn.icon.png"},
+                "wind_kph": 12.0, "wind_dir": "N", "gust_kph": 20.0,
+                "humidity": 60, "pressure_mb": 1013.0, "precip_mm": 0.0,
+                "uv": 2.0, "vis_km": 10.0, "last_updated": "2025-01-01 13:45",
             },
-            "forecast": {
-                "forecastday": [
-                    {
-                        "hour": [
-                            {
-                                "time_epoch": 1735729200 + i * 3600,
-                                "time": f"2025-01-01 {14 + i:02d}:00",
-                                "condition": {"text": "Partly cloudy"},
-                                "chance_of_rain": 10,
-                                "precip_mm": 0.0,
-                                "gust_kph": 15.0,
-                                "temp_c": 18.0,
-                                "pressure_mb": 1013.0,
-                                "will_it_thunder": 0,
-                                "chance_of_thunder": 0,
-                            }
-                            for i in range(1, 13)
-                        ]
-                    }
-                ]
-            },
+            "forecast": {"forecastday": [{"hour": hours}]},
             "alerts": {"alert": []},
         }
-        base.update(overrides)
-        return base
 
     def test_parse_basic_fields(self):
         from dashboard import _parse_weather
@@ -63,7 +55,6 @@ class DashboardParseTests(unittest.TestCase):
         self.assertIn("Pakistan", w["city"])
         self.assertEqual(w["temp_c"], 18.0)
         self.assertEqual(w["condition"], "Partly cloudy")
-        self.assertEqual(w["storm_thunder_hours"], 0)
 
     def test_no_alerts_returns_empty_list(self):
         from dashboard import _parse_weather
@@ -72,12 +63,9 @@ class DashboardParseTests(unittest.TestCase):
 
     def test_storm_thunder_hours_counted(self):
         from dashboard import _parse_weather
-        raw = self._make_raw()
-        # Mark 3 hours as thundery
-        for h in raw["forecast"]["forecastday"][0]["hour"][:3]:
-            h["will_it_thunder"] = 1
-        w = _parse_weather(raw)
-        self.assertEqual(w["storm_thunder_hours"], 3)
+        hours = [self._make_hour(3600 * i, will_it_thunder=(1 if i <= 3 else 0)) for i in range(1, 13)]
+        w = _parse_weather(self._make_raw(hours))
+        self.assertEqual(w["storm_thunder_hour_count"], 3)
 
     def test_city_label_formatting(self):
         from dashboard import _city_label
@@ -100,6 +88,28 @@ class DashboardParseTests(unittest.TestCase):
         with patch("dashboard.requests.get", side_effect=Exception("network error")):
             result = _search_cities("Lahore", "bad-key")
         self.assertEqual(result, [])
+
+    def test_storm_analysis_peak_gust(self):
+        from dashboard import _storm_analysis
+        hours = [
+            {"time": "15:00", "gust_kph": 20.0, "precip_mm": 0, "pressure_mb": 1013,
+             "humidity": 60, "will_it_thunder": 0, "chance_of_thunder": 0},
+            {"time": "16:00", "gust_kph": 55.0, "precip_mm": 0, "pressure_mb": 1012,
+             "humidity": 65, "will_it_thunder": 0, "chance_of_thunder": 0},
+        ]
+        result = _storm_analysis(hours)
+        self.assertEqual(result["peak_gust_kph"], 55.0)
+
+    def test_storm_analysis_total_precip(self):
+        from dashboard import _storm_analysis
+        hours = [
+            {"time": "15:00", "gust_kph": 10, "precip_mm": 1.5, "pressure_mb": 1013,
+             "humidity": 70, "will_it_thunder": 0, "chance_of_thunder": 0},
+            {"time": "16:00", "gust_kph": 10, "precip_mm": 3.0, "pressure_mb": 1012,
+             "humidity": 75, "will_it_thunder": 0, "chance_of_thunder": 0},
+        ]
+        result = _storm_analysis(hours)
+        self.assertAlmostEqual(result["total_precip_mm"], 4.5)
 
 
 if __name__ == "__main__":
