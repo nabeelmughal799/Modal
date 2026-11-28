@@ -1,4 +1,3 @@
-import hashlib
 import os
 from pathlib import Path
 
@@ -13,11 +12,7 @@ from assistant import (
     make_weather_pdf,
     transcribe_audio,
 )
-from attachments import (
-    MAX_ATTACHMENTS,
-    MAX_FILE_BYTES,
-    validate_attachments,
-)
+from attachments import MAX_ATTACHMENTS, MAX_FILE_BYTES, validate_attachments
 from chat_store import chat_title
 from guest_store import (
     add_guest_message,
@@ -25,250 +20,221 @@ from guest_store import (
     list_guest_chats,
     load_guest_active_attachments,
     save_guest_attachment,
-    set_guest_chat_title,
 )
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 
 
-def get_secret(name: str) -> str | None:
+def get_secret(name):
+    """Local .env ya Streamlit Cloud Secrets se key lo."""
     value = os.getenv(name)
     if value:
         return value
+
     try:
         return st.secrets.get(name)
     except FileNotFoundError:
         return None
 
 
-def reset_composer() -> None:
+def reset_composer():
+    """Chat change ya send hone par purani voice aur files clear karo."""
+    st.session_state.pop("voice_files", None)
+    st.session_state.pop("voice_draft", None)
     st.session_state["composer_nonce"] = st.session_state.get("composer_nonce", 0) + 1
 
 
-def render_message(message: dict) -> None:
+def render_message(message):
     with st.chat_message(message["role"]):
         if message["content"]:
             st.markdown(message["content"])
-        for attachment in message.get("attachments", []):
-            st.caption(f"Attached: {attachment['file_name']}")
+
+        for file in message.get("attachments", []):
+            st.caption(f"Attached: {file['file_name']}")
 
         metadata = message.get("metadata") or {}
-        for graph in metadata.get("diagrams", []):
-            st.graphviz_chart(graph)
+
+        for diagram in metadata.get("diagrams", []):
+            st.graphviz_chart(diagram)
 
         if metadata.get("weather"):
             try:
-                pdf_data = make_weather_pdf(
-                    {"content": message["content"], "metadata": metadata}
+                # PDF ek baar banti hai, phir isi chat se dobara download hoti hai.
+                if "pdf_data" not in message:
+                    message["pdf_data"] = make_weather_pdf({
+                        "content": message["content"],
+                        "metadata": metadata,
+                    })
+
+                st.download_button(
+                    "Download weather PDF",
+                    data=message["pdf_data"],
+                    file_name=f"weather-{message['id']}.pdf",
+                    mime="application/pdf",
+                    key=f"pdf-{message['id']}",
                 )
             except ValueError as error:
                 st.warning(str(error))
-            else:
-                st.download_button(
-                    "Download weather PDF",
-                    data=pdf_data,
-                    file_name=f"weather-{message['id']}.pdf",
-                    mime="application/pdf",
-                    key=f"weather-pdf-{message['id']}",
-                )
 
 
-def show_chat_sidebar() -> tuple[dict | None, list[dict]]:
-    chats = list_guest_chats(st.session_state.setdefault("guest_chats", {}))
-    chat_ids = {chat["id"] for chat in chats}
+def show_sidebar():
+    chats = st.session_state.setdefault("guest_chats", {})
 
     with st.sidebar:
         st.title("Chats")
-        if st.button("New chat", use_container_width=True):
+
+        if st.button("New chat", width="stretch"):
             st.session_state["active_chat_id"] = None
-            st.session_state["new_chat_requested"] = True
             reset_composer()
             st.rerun()
 
-        selected_id = st.session_state.get("active_chat_id")
-        if selected_id not in chat_ids:
-            selected_id = None
-            if not st.session_state.get("new_chat_requested") and chats:
-                selected_id = chats[0]["id"]
-                st.session_state["active_chat_id"] = selected_id
+        for chat in list_guest_chats(chats):
+            selected = chat["id"] == st.session_state.get("active_chat_id")
 
-        for chat in chats:
             if st.button(
                 chat["title"],
-                key=f"open-chat-{chat['id']}",
-                use_container_width=True,
-                type="primary" if chat["id"] == selected_id else "secondary",
+                key=f"open-{chat['id']}",
+                type="primary" if selected else "secondary",
+                width="stretch",
             ):
                 st.session_state["active_chat_id"] = chat["id"]
-                st.session_state["new_chat_requested"] = False
                 reset_composer()
                 st.rerun()
 
         st.divider()
         st.caption("Guest mode · chats last for this session")
 
-    active_chat = next((chat for chat in chats if chat["id"] == selected_id), None)
-    messages = active_chat["messages"] if active_chat else []
-    return active_chat, messages
+    return chats.get(st.session_state.get("active_chat_id"))
 
 
-def render_composer(google_api_key: str | None) -> tuple[str, list[tuple[str, bytes]], bool]:
-    nonce = st.session_state.get("composer_nonce", 0)
-    question_key = f"question-{nonce}"
-    audio_key = f"audio-{nonce}"
-    audio_hash_key = f"audio-hash-{nonce}"
-    upload_key = f"uploads-{nonce}"
+def send_message(chat, question, files):
+    question = question.strip()
+    attachments = validate_attachments(files)
 
-    question_column, microphone_column = st.columns([8, 2])
-    with microphone_column:
-        audio = st.audio_input(
-            "Record a question",
-            sample_rate=16000,
-            key=audio_key,
-        )
+    if not question and not attachments:
+        raise ValueError("Type a question or attach a file.")
 
-    if audio is not None:
-        audio_bytes = audio.getvalue()
-        audio_hash = hashlib.sha256(audio_bytes).hexdigest()
-        if st.session_state.get(audio_hash_key) != audio_hash:
-            st.session_state[audio_hash_key] = audio_hash
-            if not google_api_key:
-                st.warning("Add GOOGLE_API_KEY to transcribe a recording.")
-            else:
-                try:
-                    st.session_state[question_key] = transcribe_audio(
-                        audio_bytes, google_api_key
-                    )
-                except (GoogleAPIError, HttpClientError, ValueError) as error:
-                    st.warning(f"Transcription failed: {error}")
-                else:
-                    st.caption("Review or edit the transcript before sending.")
-
-    with question_column:
-        st.text_input(
-            "Message",
-            key=question_key,
-            placeholder="Type a question or review the transcript...",
-            label_visibility="collapsed",
-        )
-
-    uploads = st.file_uploader(
-        "Attach PDF, DOCX, TXT, JPG, or PNG files",
-        type=["pdf", "docx", "txt", "jpg", "jpeg", "png"],
-        accept_multiple_files=True,
-        key=upload_key,
-        help=(
-            f"Up to {MAX_ATTACHMENTS} files per message; "
-            f"{MAX_FILE_BYTES // (1024 * 1024)} MB per file."
-        ),
-    )
-    send = st.button("Send", type="primary", use_container_width=True)
-    files = [(item.name, item.getvalue()) for item in uploads] if uploads else []
-    return st.session_state.get(question_key, ""), files, send
-
-
-def save_and_answer(
-    chat: dict | None,
-    messages: list[dict],
-    question: str,
-    files: list[tuple[str, bytes]],
-) -> None:
-    prepared = validate_attachments(files)
-    if not question.strip() and not prepared:
-        raise ValueError("Type a question, attach a file, or record a voice question.")
-    google_api_key = get_secret("GOOGLE_API_KEY")
-    if question.strip() and not google_api_key:
+    google_key = get_secret("GOOGLE_API_KEY")
+    if question and not google_key:
         raise ValueError("Set GOOGLE_API_KEY in Streamlit Secrets.")
 
-    file_names = [attachment.file_name for attachment in prepared]
-    first_user_message = not any(row["role"] == "user" for row in messages)
-    title = chat_title(question, file_names)
-    chats = st.session_state.setdefault("guest_chats", {})
     if chat is None:
-        chat = create_guest_chat(chats, title)
+        file_names = [file.file_name for file in attachments]
+        title = chat_title(question, file_names)
+        chat = create_guest_chat(st.session_state["guest_chats"], title)
         st.session_state["active_chat_id"] = chat["id"]
-        st.session_state["new_chat_requested"] = False
-    elif first_user_message:
-        set_guest_chat_title(chat, title)
 
-    user_message = add_guest_message(
-        chat,
-        "user",
-        question.strip(),
-    )
-    stored_attachments = [
-        save_guest_attachment(chat, user_message["id"], attachment)
-        for attachment in prepared
+    # Naya sawal add karne se pehle history lo, taake sawal do baar na jaye.
+    history = [
+        {"role": msg["role"], "content": msg["content"]}
+        for msg in chat["messages"]
+        if msg.get("content")
     ]
 
-    active_ids = (
-        [attachment["id"] for attachment in stored_attachments]
-        if stored_attachments
-        else chat.get("active_attachment_ids", [])
-    )
-    if stored_attachments:
-        chat["active_attachment_ids"] = active_ids
+    user_message = add_guest_message(chat, "user", question)
 
-    if not question.strip() and stored_attachments:
-        add_guest_message(
-            chat,
-            "assistant",
-            FILE_ONLY_QUESTION,
-        )
+    if attachments:
+        saved = [
+            save_guest_attachment(chat, user_message["id"], file)
+            for file in attachments
+        ]
+        chat["active_attachment_ids"] = [file["id"] for file in saved]
+
+    # Agent ke jawab ka intezar karte hue user ko apna message nazar aata hai.
+    render_message(user_message)
+
+    if not question:
+        add_guest_message(chat, "assistant", FILE_ONLY_QUESTION)
         return
-    if not question.strip():
-        raise ValueError("Type a question, attach a file, or record a voice question.")
 
-    active_attachments = load_guest_active_attachments(chat, active_ids)
-    previous_history = [
-        {"role": row["role"], "content": row["content"]}
-        for row in messages
-        if row.get("content")
-    ]
+    active_files = load_guest_active_attachments(
+        chat, chat.get("active_attachment_ids", [])
+    )
+
     reply = ask_agent(
-        previous_history,
+        history,
         question,
-        active_attachments,
-        google_api_key,
+        active_files,
+        google_key,
         get_secret("WEATHER_API_KEY") or "",
         get_secret("TAVILY_API_KEY") or "",
     )
-    add_guest_message(
-        chat,
-        "assistant",
-        reply["content"],
-        reply["metadata"],
-    )
+
+    add_guest_message(chat, "assistant", reply["content"], reply["metadata"])
 
 
-st.set_page_config(page_title="My AI Assistant", layout="wide")
-st.title("My AI Assistant")
+# -------------------- Streamlit UI --------------------
 
-active_chat, messages = show_chat_sidebar()
-for message in messages:
-    render_message(message)
+st.set_page_config(
+    page_title="Weather Assistant",
+    page_icon="🌤️",
+    layout="centered",
+)
 
-question, uploaded_files, send = render_composer(get_secret("GOOGLE_API_KEY"))
-if send:
+st.title("Weather Assistant")
+active_chat = show_sidebar()
+
+if active_chat:
+    for message in active_chat["messages"]:
+        render_message(message)
+
+nonce = st.session_state.get("composer_nonce", 0)
+input_key = f"composer-{nonce}"
+pending_files = st.session_state.get("voice_files", [])
+
+if pending_files:
+    names = ", ".join(name for name, _ in pending_files)
+    st.caption(f"Attached to draft: {names}")
+
+    if st.button("Remove draft attachments"):
+        st.session_state.pop("voice_files", None)
+        st.rerun()
+
+# Voice transcript isi input mein aata hai, jahan user usay edit kar sakta hai.
+if "voice_draft" in st.session_state:
+    st.session_state[input_key] = st.session_state.pop("voice_draft")
+
+# Ek field: left par upload, right par mic. Enter se message send hota hai.
+prompt = st.chat_input(
+    "Apna sawal yahan likhein…",
+    key=input_key,
+    accept_file="multiple",
+    file_type=["pdf", "docx", "txt", "jpg", "jpeg", "png"],
+    accept_audio=True,
+    max_upload_size=MAX_FILE_BYTES // (1024 * 1024),
+)
+
+if prompt:
+    files = pending_files + [
+        (file.name, file.getvalue()) for file in prompt.files
+    ]
+
     try:
-        save_and_answer(
-            active_chat,
-            messages,
-            question,
-            uploaded_files,
-        )
-    except (
-        ValueError,
-        GoogleAPIError,
-        HttpClientError,
-    ) as error:
-        st.session_state["flash_error"] = str(error)
-    else:
-        st.session_state.pop("flash_error", None)
-    reset_composer()
-    st.rerun()
+        if prompt.audio is not None:
+            google_key = get_secret("GOOGLE_API_KEY")
 
-flash_error = st.session_state.pop("flash_error", None)
-if flash_error:
-    st.error(f"Could not send the message: {flash_error}")
+            if not google_key:
+                raise ValueError("Voice ke liye GOOGLE_API_KEY add karein.")
+
+            if len(files) > MAX_ATTACHMENTS:
+                raise ValueError(f"Maximum {MAX_ATTACHMENTS} files attach karein.")
+
+            with st.spinner("Voice ko text mein badal raha hoon…"):
+                transcript = transcribe_audio(prompt.audio.getvalue(), google_key)
+
+            st.session_state["voice_draft"] = " ".join(
+                filter(None, [prompt.text, transcript])
+            )
+            st.session_state["voice_files"] = files
+            st.rerun()
+
+        with st.spinner("Jawab tayyar ho raha hai…"):
+            send_message(active_chat, prompt.text, files)
+
+    except (ValueError, GoogleAPIError, HttpClientError) as error:
+        st.error(f"Message send nahi hua. {error}")
+
+    else:
+        reset_composer()
+        st.rerun()
