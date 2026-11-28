@@ -10,5 +10,7 @@ uharfbuzz>=0.45
 graphviz>=0.20,<1
 python-docx>=1.1,<2
 pypdf>=5,<7
+Pillow>=10,<12
+pandas>=2,<4
 supabase==2.34.1
-streamlit>=1.67,<2
+streamlit>=1.45,<2
